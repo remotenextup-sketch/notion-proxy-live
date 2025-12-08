@@ -1,0 +1,9 @@
+{
+  "name": "notion-timer-proxy",
+  "version": "1.0.0",
+  "description": "Proxy for Notion API calls.",
+  "main": "api/proxy.js",
+  "scripts": {
+    "start": "node api/proxy.js"
+  }
+}
