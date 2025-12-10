@@ -1,11 +1,11 @@
 // api/proxy.js
-// Vercel Functions (Node.js)で動作するNotion専用プロキシコード
+// Vercel Functions (Node.js)で動作するプロキシコード
 
 module.exports = async (req, res) => {
-    // 1. CORSヘッダーの設定 (必須)
+    // CORSヘッダーを設定: どこからのリクエストも受け付けるように設定
     res.setHeader('Access-Control-Allow-Origin', '*'); 
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PATCH');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
     // OPTIONSメソッド（プリフライトリクエスト）への対応
     if (req.method === 'OPTIONS') {
@@ -14,29 +14,35 @@ module.exports = async (req, res) => {
     }
 
     if (req.method !== 'POST') {
-        res.status(405).json({ message: 'Method Not Allowed. Only POST is accepted for proxy execution.' });
+        res.status(405).json({ message: 'Method Not Allowed. Only POST is accepted for proxy.' });
         return;
     }
 
     try {
-        // リクエストボディから転送に必要な情報を取得
         const { targetUrl, method, body, tokenKey, tokenValue } = req.body;
         
-        if (!targetUrl || !tokenValue || tokenKey !== 'notionToken') {
-            res.status(400).json({ message: 'Missing targetUrl, tokenValue, or invalid tokenKey. This proxy only handles Notion.' });
+        if (!targetUrl || !tokenValue) {
+            res.status(400).json({ message: 'Missing targetUrl or tokenValue in request body.' });
             return;
         }
 
-        // Notion向けのヘッダーを作成
-        const headers = { 
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${tokenValue}`, // Notion Token
-            'Notion-Version': '2022-06-28'
-        };
+        // NotionまたはToggl向けのヘッダーを作成
+        const headers = { 'Content-Type': 'application/json' };
         
-        // 実際のNotion APIリクエストの実行
+        if (tokenKey === 'notionToken') {
+            headers['Authorization'] = `Bearer ${tokenValue}`;
+            headers['Notion-Version'] = '2022-06-28';
+        } else if (tokenKey === 'togglApiToken') {
+            // TogglはBasic認証を使用
+            headers['Authorization'] = 'Basic ' + Buffer.from(tokenValue + ':api_token').toString('base64');
+        } else {
+            res.status(400).json({ message: 'Invalid tokenKey specified.' });
+            return;
+        }
+
+        // 実際のAPIリクエストの実行
         const fetchRes = await fetch(targetUrl, {
-            method: method, // GET, POST, PATCH
+            method: method,
             headers: headers,
             body: body ? JSON.stringify(body) : null,
         });
