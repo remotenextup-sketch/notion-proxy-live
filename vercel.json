@@ -5,13 +5,21 @@
       "runtime": "nodejs18.x"
     }
   },
+  "routes": [
+    {
+      "src": "/api/proxy",
+      "methods": ["GET", "POST", "PATCH", "OPTIONS"],
+      "dest": "/api/proxy.js"
+    }
+  ],
   "headers": [
     {
-      "source": "/api/(.*)",
+      "source": "/api/proxy",
       "headers": [
         { "key": "Access-Control-Allow-Origin", "value": "*" },
         { "key": "Access-Control-Allow-Methods", "value": "GET,POST,PATCH,OPTIONS" },
-        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" }
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" },
+        { "key": "Access-Control-Max-Age", "value": "86400" }
       ]
     }
   ]
