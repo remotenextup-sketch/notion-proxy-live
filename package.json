@@ -1,7 +1,7 @@
 {
-  "name": "notion-timer-proxy",
+  "name": "notion-toggl-proxy",
   "version": "1.0.0",
-  "description": "Proxy for Notion API calls.",
+  "description": "Proxy for Notion and Toggl API calls.",
   "main": "api/proxy.js",
   "scripts": {
     "start": "node api/proxy.js"
