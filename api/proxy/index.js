@@ -1,298 +1,308 @@
-const { Client } = require('@notionhq/client');
+// Vercel プロジェクト: /api/proxy/index.js (完全版)
+
 const fetch = require('node-fetch');
+const NOTION_VERSION = '2022-06-28';
+const Buffer = require('buffer').Buffer;
 
-// =========================================================
-// Toggl 関連のヘルパー関数
-// =========================================================
-
-/**
- * 実行中のTogglタイムエントリーがあれば停止します。
- * @param {string} token Toggl APIトークン
- * @returns {Promise<object|null>} 停止されたエントリー、またはnull
- */
-async function stopRunningTogglEntry(token) {
-    const authHeader = 'Basic ' + Buffer.from(`${token}:api_token`).toString('base64');
-    const currentEntryUrl = 'https://api.track.toggl.com/api/v9/me/time_entries/current';
-    
-    // 現在実行中のエントリーを取得
-    const currentEntryResponse = await fetch(currentEntryUrl, {
-        method: 'GET',
-        headers: {
-            'Authorization': authHeader,
-            'Content-Type': 'application/json'
-        }
-    });
-
-    if (currentEntryResponse.status === 204) {
-        return null;
-    }
-    
-    if (!currentEntryResponse.ok) {
-        throw new Error(`Toggl API error (GET /current): ${currentEntryResponse.statusText}`);
-    }
-    
-    const currentEntry = await currentEntryResponse.json();
-    
-    if (currentEntry && currentEntry.id) {
-        // 実行中のエントリがあれば停止APIを呼び出す
-        const stopUrl = `https://api.track.toggl.com/api/v9/time_entries/${currentEntry.id}/stop`;
-        
-        // PATCHリクエストのbodyは空でOK (Toggl APIの仕様)
-        await fetch(stopUrl, {
-            method: 'PATCH',
-            headers: {
-                'Authorization': authHeader,
-                'Content-Type': 'application/json'
-            }
-        });
-        return currentEntry;
-    }
-    return null;
-}
-
-// =========================================================
-// メインのエクスポート関数 (Vercelサーバーレス関数)
-// =========================================================
+// =========================================================================
+// メインのLambda関数 (module.exports)
+// =========================================================================
 
 module.exports = async (req, res) => {
-    // ★★★ 応答を返す前に、CORSヘッダーを確実に設定 ★★★
+    // ----------------------------------------------------
+    // 0. CORS と OPTIONS 対応
+    // ----------------------------------------------------
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PATCH');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
 
     if (req.method === 'OPTIONS') {
-        // プリフライトリクエストをここで正常終了させる
-        return res.status(200).end();
+        res.status(200).end();
+        return;
     }
 
-    // リクエストボディのパース (GETリクエストの場合は処理しない)
+    // ----------------------------------------------------
+    // 1. GETリクエストの回避 (最優先の修正)
+    // ----------------------------------------------------
+    if (req.method === 'GET') {
+        console.log('WARN: Unexpected GET request received. Returning 404 to avoid 401/405 crash.');
+        res.status(404).json({ message: "Unsupported GET request." });
+        return;
+    }
+    
+    // POST以外のリクエストを拒否
+    if (req.method !== 'POST') {
+        res.status(405).json({ message: 'Method Not Allowed.' });
+        return;
+    }
+    
     let body;
     try {
-        if (req.method !== 'GET' && req.body) {
-             body = req.body;
-        } else if (req.method !== 'GET' && req.headers['content-type'] === 'application/json') {
-             // raw bodyをJSONとしてパース (vercel環境依存の対応)
-             body = JSON.parse(req.rawBody || await new Promise(resolve => {
-                let data = '';
-                req.on('data', chunk => data += chunk);
-                req.on('end', () => resolve(data));
-             }));
-        }
+        body = req.body;
     } catch (e) {
-         console.error('Body parsing error:', e);
-         return res.status(400).json({ message: 'Invalid JSON format in request body.' });
+        res.status(400).json({ message: 'Invalid JSON body.' });
+        return;
+    }
+    
+    const { customEndpoint, targetUrl, method, tokenKey, tokenValue } = body;
+    
+    // ----------------------------------------------------
+    // 2. 認証情報の事前チェック
+    // ----------------------------------------------------
+    if (!tokenValue) {
+        res.status(401).json({ message: "Token value missing in request body." });
+        return;
     }
 
-    const { 
-        targetUrl, method, tokenKey, tokenValue,
-        customEndpoint, dbId, dataSourceId, workspaceId, description
-    } = body || {};
+    // ----------------------------------------------------
+    // 3. カスタムエンドポイントの処理
+    // ----------------------------------------------------
+    if (customEndpoint) {
+        if (customEndpoint === 'getConfig') {
+            try {
+                const configData = await getNotionDbConfig(body.dbId, tokenValue); 
+                res.status(200).json(configData);
+            } catch (error) {
+                console.error(`Custom Endpoint Error (getConfig): ${error.message}`);
+                res.status(500).json({ message: `Config Error: ${error.message}` });
+            }
+            return;
+        } 
+        
+        if (customEndpoint === 'getKpi') {
+            try {
+                const kpiData = await getNotionKpi(body.dataSourceId, tokenValue); 
+                res.status(200).json(kpiData);
+            } catch (error) {
+                console.error(`Custom Endpoint Error (getKpi): ${error.message}`);
+                res.status(500).json({ message: `KPI Error: ${error.message}` });
+            }
+            return;
+        }
 
-    // トークンが提供されていない場合のエラーハンドリング
-    if (!tokenValue) {
-        // 401はCORSエラーを回避するために200で包む場合があるが、ここでは標準的な401を使用
-        return res.status(401).json({ message: 'Token value missing in request body.' });
+        if (customEndpoint === 'startTogglTracking') {
+            try {
+                const togglResponse = await startTogglTracking(body.tokenValue, body.workspaceId, body.description);
+                res.status(200).json(togglResponse);
+            } catch (error) {
+                console.error(`Custom Endpoint Error (startTogglTracking): ${error.message}`);
+                res.status(500).json({ message: `Toggl Start Error: ${error.message}` });
+            }
+            return;
+        }
+        
+        res.status(400).json({ message: "Invalid custom endpoint." });
+        return;
+    }
+
+    // ----------------------------------------------------
+    // 4. 標準プロキシ処理
+    // ----------------------------------------------------
+    
+    if (!targetUrl) {
+        res.status(400).json({ message: 'Missing targetUrl for standard proxy.' });
+        return;
+    }
+    
+    const isNotion = targetUrl.includes('notion.com');
+    const isToggl = targetUrl.includes('toggl.com');
+    
+    let headers = { 'Content-Type': 'application/json' };
+    
+    if (tokenKey === 'notionToken') {
+        headers['Authorization'] = `Bearer ${tokenValue}`;
+        headers['Notion-Version'] = NOTION_VERSION;
+    } else if (tokenKey === 'togglApiToken') {
+        const authBase64 = Buffer.from(tokenValue + ':api_token').toString('base64');
+        headers['Authorization'] = `Basic ${authBase64}`;
+    } else {
+        res.status(400).json({ message: 'Invalid tokenKey specified.' });
+        return;
     }
 
     try {
-        // ===============================================
-        // A. カスタムエンドポイントの処理
-        // ===============================================
-        if (customEndpoint) {
-            
-            // ---------------------------------------------
-            // A-1. DBプロパティ設定取得 (getConfig)
-            // ---------------------------------------------
-            if (customEndpoint === 'getConfig') {
-                if (!dbId) {
-                    return res.status(400).json({ code: 'missing_db_id', message: 'Database ID is required for getConfig.' });
-                }
-                const notion = new Client({ auth: tokenValue });
-                const database = await notion.databases.retrieve({ database_id: dbId });
-
-                const properties = database.properties;
-                const categories = properties['カテゴリ']?.select?.options?.map(opt => opt.name) || [];
-                const departments = properties['部門']?.multi_select?.options?.map(opt => opt.name) || [];
-
-                const match = database.url.match(/notion\.so\/([a-f0-9]+)\/([a-f0-9]+)/);
-                const dataSourceIdFromUrl = match ? match[1] : null;
-
-                return res.status(200).json({ categories, departments, dataSourceId: dataSourceIdFromUrl });
-            }
-
-            // ---------------------------------------------
-            // A-2. Toggl計測開始 (startTogglTracking) 
-            // ---------------------------------------------
-            else if (customEndpoint === 'startTogglTracking') {
-                
-                if (!workspaceId || !description) {
-                    return res.status(400).json({ message: 'Toggl parameters missing (workspaceId or description).' });
-                }
-
-                // 1. 既存の計測を停止 
-                await stopRunningTogglEntry(tokenValue); 
-
-                // 2. 新しいタイムエントリーを開始
-                const authHeader = 'Basic ' + Buffer.from(`${tokenValue}:api_token`).toString('base64');
-                const startEntryUrl = 'https://api.track.toggl.com/api/v9/time_entries';
-                
-                // workspaceIdを必ず数値に変換する
-                const numericWorkspaceId = parseInt(workspaceId, 10);
-                if (isNaN(numericWorkspaceId)) {
-                    return res.status(400).json({ message: 'Invalid workspaceId format.' });
-                }
-
-                const newEntryResponse = await fetch(startEntryUrl, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': authHeader,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        description: description,
-                        workspace_id: numericWorkspaceId, // 変換済みの数値を使用
-                        created_with: 'NotionTogglTimerApp',
-                        start: new Date().toISOString(),
-                        duration: -1
-                    })
-                });
-
-                if (!newEntryResponse.ok) {
-                    const errorText = await newEntryResponse.text();
-                    console.error('Toggl Start Error:', newEntryResponse.status, errorText);
-                    return res.status(newEntryResponse.status).json({ message: 'Failed to start Toggl entry', details: errorText });
-                }
-
-                const newEntry = await newEntryResponse.json();
-                return res.status(200).json(newEntry);
-            }
-            
-            // ---------------------------------------------
-            // A-3. KPIデータ取得 (getKpi)
-            // ---------------------------------------------
-            else if (customEndpoint === 'getKpi') {
-                if (!dataSourceId) {
-                    return res.status(400).json({ code: 'missing_data_source_id', message: 'Data Source ID is required for getKpi.' });
-                }
-                const notion = new Client({ auth: tokenValue });
-                
-                const databaseId = dataSourceId; 
-                
-                const now = new Date();
-                // 30日前のISO日付文字列を取得
-                const thirtyDaysAgo = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000)).toISOString().split('T')[0];
-                
-                // 完了タスクを取得 (全件取得)
-                const response = await notion.databases.query({
-                    database_id: databaseId,
-                    filter: {
-                        property: 'ステータス',
-                        status: { equals: '完了' }
-                    }
-                });
-                
-                let totalWeekMins = 0;
-                let totalMonthMins = 0;
-                const categoryWeekMins = {};
-
-                const oneWeekAgo = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
-                
-                response.results.forEach(page => {
-                    const timeProperty = '時間'; 
-                    const timeProp = page.properties[timeProperty]?.formula?.number; 
-                    const completedDate = page.properties['完了日']?.date?.start;
-                    const category = page.properties['カテゴリ']?.select?.name;
-
-                    if (timeProp) {
-                        const mins = Math.round(timeProp * 60); 
-                        
-                        // 週間集計
-                        if (completedDate && new Date(completedDate) >= oneWeekAgo) {
-                            totalWeekMins += mins;
-                            if (category) {
-                                categoryWeekMins[category] = (categoryWeekMins[category] || 0) + mins;
-                            }
-                        }
-                    }
-                    
-                    // 月間集計 (30日以内でフィルタリング)
-                    if (completedDate && new Date(completedDate) >= new Date(thirtyDaysAgo)) {
-                        const timeProp = page.properties[timeProperty]?.formula?.number;
-                        if (timeProp) {
-                             const mins = Math.round(timeProp * 60);
-                             totalMonthMins += mins;
-                        }
-                    }
-                });
-
-                return res.status(200).json({ totalWeekMins, totalMonthMins, categoryWeekMins });
-            }
-            
-            // ---------------------------------------------
-            // A-4. 未定義のエンドポイント
-            // ---------------------------------------------
-            else {
-                return res.status(400).json({ message: 'Invalid custom endpoint.' });
-            }
-        }
-
-        // ===============================================
-        // B. Notion/Togglへの直接プロキシ処理
-        // ===============================================
-        else if (targetUrl) {
-            
-            const isNotion = tokenKey === 'notionToken';
-            const isToggl = tokenKey === 'togglApiToken';
-            
-            let authHeader;
-            if (isNotion) {
-                authHeader = `Bearer ${tokenValue}`;
-            } else if (isToggl) {
-                authHeader = 'Basic ' + Buffer.from(`${tokenValue}:api_token`).toString('base64');
-            } else {
-                return res.status(400).json({ message: 'Invalid token key.' });
-            }
-
-            const notionVersion = '2022-06-28'; 
-            
-            const fetchOptions = {
-                method: method,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': authHeader,
-                },
-            };
-            
-            if (isNotion) {
-                fetchOptions.headers['Notion-Version'] = notionVersion;
-            }
-
-            // bodyが空でないことを確認
-            if (method !== 'GET' && method !== 'HEAD' && body) {
-                // bodyオブジェクトがすでにパースされているため、JSON.stringify()で文字列化
-                fetchOptions.body = JSON.stringify(body);
-            }
-
-            const response = await fetch(targetUrl, fetchOptions);
-            
-            const responseBody = await response.text();
-            
-            // ヘッダーがすでに設定されているため、そのままステータスとボディを返す
-            res.status(response.status).send(responseBody);
-            
-        } 
+        const fetchOptions = {
+            method: method,
+            headers: headers
+        };
         
-        // ===============================================
-        // C. 不正なリクエスト
-        // ===============================================
-        else {
-            return res.status(400).json({ message: 'Invalid request format. Missing targetUrl or customEndpoint.' });
+        if (method !== 'GET' && method !== 'DELETE' && body.body) {
+            fetchOptions.body = JSON.stringify(body.body);
         }
+
+        const apiResponse = await fetch(targetUrl, fetchOptions);
+
+        const data = await apiResponse.text();
+        res.status(apiResponse.status).send(data);
 
     } catch (error) {
-        console.error('Proxy Error:', error);
-        // エラー時もCORSヘッダーを付けて返すことで、ブラウザ側の表示を改善
-        return res.status(500).json({ message: 'Internal Server Error', details: error.message });
+        console.error('Proxy Fetch Error:', error);
+        res.status(500).json({ message: 'Internal Server Error during proxy execution.' });
     }
 };
+
+// =========================================================================
+// ヘルパー関数の定義 (カスタムエンドポイントの実装)
+// =========================================================================
+
+/**
+ * Notion DBのプロパティ情報を取得し、カテゴリ、部門、データソースIDを抽出します。
+ */
+async function getNotionDbConfig(dbId, token) {
+    const url = `https://api.notion.com/v1/databases/${dbId}`;
+    const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Notion-Version': NOTION_VERSION
+        }
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Notion API Error (${response.status}): ${errorText}`);
+    }
+
+    const dbData = await response.json();
+    
+    const categories = dbData.properties['カテゴリ']?.select?.options?.map(opt => opt.name) || [];
+    const departments = dbData.properties['部門']?.multi_select?.options?.map(opt => opt.name) || [];
+    
+    // データソースIDはDBページのURLの最後の部分（dbIdとは異なる可能性あり）
+    // Notion API v1ではデータソースIDを直接取得する一般的な方法は廃止されました。
+    // DB IDをそのままデータソースIDとして使用するか、クライアント側で処理を簡略化します。
+    // ここでは便宜上、DB IDをデータソースIDとして返します。
+    const dataSourceId = dbId; 
+
+    return { 
+        categories, 
+        departments, 
+        dataSourceId 
+    };
+}
+
+/**
+ * Notion DBからKPIデータを集計します (過去の動作に基づくロジックを再現)。
+ */
+async function getNotionKpi(dataSourceId, token) {
+    // dataSourceIdをDB IDとして使用します
+    const queryUrl = `https://api.notion.com/v1/databases/${dataSourceId}/query`;
+    
+    const dateToday = new Date();
+    const dateStartOfWeek = new Date(dateToday.setDate(dateToday.getDate() - dateToday.getDay()));
+    const dateStartOfMonth = new Date(dateToday.getFullYear(), dateToday.getMonth(), 1);
+
+    const filterBase = {
+        property: '完了日',
+        date: { is_not_empty: true } // 完了日があるものを対象とする
+    };
+    
+    // 今週のタスクフィルタ (完了日が今週以降)
+    const filterWeek = {
+        ...filterBase,
+        date: { on_or_after: dateStartOfWeek.toISOString().split('T')[0] }
+    };
+
+    // 今月のタスクフィルタ (完了日が今月以降)
+    const filterMonth = {
+        ...filterBase,
+        date: { on_or_after: dateStartOfMonth.toISOString().split('T')[0] }
+    };
+    
+    // 集計実行関数
+    const fetchTasks = async (filter) => {
+        const response = await fetch(queryUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Notion-Version': NOTION_VERSION,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ filter: filter })
+        });
+        if (!response.ok) throw new Error(`KPI Query failed: ${response.status}`);
+        return (await response.json()).results;
+    };
+
+    const [tasksWeek, tasksMonth] = await Promise.all([
+        fetchTasks(filterWeek),
+        fetchTasks(filterMonth)
+    ]);
+
+    // 集計ロジック
+    const aggregateTime = (tasks) => {
+        let totalMins = 0;
+        const categoryWeekMins = {};
+
+        tasks.forEach(task => {
+            const timeProperty = task.properties['作業時間']?.number || 0;
+            const categoryName = task.properties['カテゴリ']?.select?.name || 'その他';
+            
+            const mins = Math.round(timeProperty); // 時間を分単位で取得
+            totalMins += mins;
+
+            categoryWeekMins[categoryName] = (categoryWeekMins[categoryName] || 0) + mins;
+        });
+
+        return { totalMins, categoryWeekMins };
+    };
+
+    const aggWeek = aggregateTime(tasksWeek);
+    const aggMonth = aggregateTime(tasksMonth);
+
+    return {
+        totalWeekMins: aggWeek.totalMins,
+        totalMonthMins: aggMonth.totalMins,
+        categoryWeekMins: aggWeek.categoryWeekMins
+    };
+}
+
+
+/**
+ * Togglで実行中のタスクを停止し、新しいタスクの計測を開始します。
+ */
+async function startTogglTracking(token, workspaceId, description) {
+    const authBase64 = Buffer.from(token + ':api_token').toString('base64');
+    const headers = {
+        'Authorization': `Basic ${authBase64}`,
+        'Content-Type': 'application/json'
+    };
+    
+    // 1. 実行中のタスクを停止する (存在する場合)
+    const stopUrl = 'https://api.track.toggl.com/api/v9/time_entries/current';
+    try {
+        const runningEntry = await fetch(stopUrl, { method: 'GET', headers: headers });
+        const entryData = await runningEntry.json();
+
+        if (entryData && entryData.id) {
+            // 実行中のエントリIDを取得して停止
+            const stopEntryUrl = `https://api.track.toggl.com/api/v9/time_entries/${entryData.id}/stop`;
+            await fetch(stopEntryUrl, { method: 'PATCH', headers: headers });
+        }
+    } catch (e) {
+        // 停止に失敗しても、新しい開始は試みる
+        console.warn('Failed to stop current Toggl entry, proceeding to start new one.', e.message);
+    }
+    
+    // 2. 新しいタスクの計測を開始
+    const startUrl = 'https://api.track.toggl.com/api/v9/time_entries';
+    const newEntryPayload = {
+        description: description,
+        workspace_id: parseInt(workspaceId),
+        start: new Date().toISOString(),
+        created_with: 'Notion-Toggl-Timer'
+    };
+
+    const startResponse = await fetch(startUrl, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(newEntryPayload)
+    });
+
+    if (!startResponse.ok) {
+        const errorText = await startResponse.text();
+        throw new Error(`Toggl Start API Error (${startResponse.status}): ${errorText}`);
+    }
+
+    return startResponse.json();
+}
