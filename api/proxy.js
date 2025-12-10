@@ -11,7 +11,7 @@ module.exports = async function(req, res) {
   try {
     const body = req.body || {};
     
-    // ★ Notion ★
+    // Notion API
     if (body.tokenKey === 'notionToken') {
       const headers = {
         'Authorization': `Bearer ${body.tokenValue}`,
@@ -23,30 +23,46 @@ module.exports = async function(req, res) {
         headers,
         body: body.body ? JSON.stringify(body.body) : undefined
       });
+      
       const text = await upstream.text();
-      res.status(upstream.status).send(text);
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { raw: text };
+      }
+      res.status(upstream.status).json(data);
       return;
     }
     
-    // ★ Toggl ★
+    // Toggl API
     if (body.tokenKey === 'togglApiToken') {
       const basicAuth = Buffer.from(`${body.tokenValue}:api_token`).toString('base64');
       const headers = {
         'Authorization': `Basic ${basicAuth}`,
         'Content-Type': 'application/json'
       };
+      
       const upstream = await fetch(body.targetUrl, {
         method: body.method || 'GET',
         headers,
         body: body.body ? JSON.stringify(body.body) : undefined
       });
+      
       const text = await upstream.text();
-      res.status(upstream.status).send(text);
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { raw: text };
+      }
+      res.status(upstream.status).json(data);  // ✅ json()のみ！
       return;
     }
     
-    res.status(400).json({ error: 'tokenKey required (notionToken/togglApiToken)' });
+    res.status(400).json({ error: 'tokenKey required' });
   } catch (err) {
+    console.error('💥 PROXY ERROR:', err);
     res.status(500).json({ error: err.message });
   }
 };
