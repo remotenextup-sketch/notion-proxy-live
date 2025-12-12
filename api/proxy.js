@@ -1,8 +1,9 @@
-// api/proxy.js (最終安定版: ハングアップ回避と認証情報の分離)
-const axios = require('axios'); // axiosの利用は必須です。
+// api/proxy.js (node-fetchバージョン: ハングアップ回避を強化)
+// 標準の fetch APIに近い動作をNode.js環境で実現します
+const fetch = require('node-fetch'); // ★★★ axiosの代わりにnode-fetchを使用 ★★★
 
 module.exports = async function (req, res) {
-    // 1. CORSヘッダー設定 (Vercelの設定と合わせる)
+    // 1. CORSヘッダー設定 (OPTIONSリクエスト成功のため問題なし)
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Notion-Version');
@@ -13,15 +14,11 @@ module.exports = async function (req, res) {
         return;
     }
     
-    // 3. POST/PATCHリクエストの処理
-    
-    // Vercelが自動でパースしたリクエストボディを取得
     const body = req.body || {}; 
     const { targetUrl, method, tokenKey, tokenValue, notionVersion, body: apiBody } = body;
 
-    // 必須パラメーターのチェック（これが欠けると 400 を返す）
     if (!targetUrl || !tokenKey || !tokenValue) {
-        console.error('Missing targetUrl, tokenKey, or tokenValue in request body.');
+        // Missing tokenエラーを返し、保留を防ぐ
         return res.status(400).json({ 
             message: 'Missing targetUrl or tokenValue in request body payload.' 
         });
@@ -43,29 +40,32 @@ module.exports = async function (req, res) {
             };
         }
         
-        // Content-Type ヘッダーの追加 (Notion/Toggl API用)
+        // Content-Type ヘッダーの追加
         if (method === 'POST' || method === 'PATCH') {
             headers['Content-Type'] = 'application/json';
         }
 
-        // 外部APIへリクエストを転送
-        const apiRes = await axios({
-            url: targetUrl,
+        // 外部APIへリクエストを転送 (node-fetchを使用)
+        const fetchOptions = {
             method: method,
             headers: headers,
-            data: apiBody 
-        });
+            // apiBody が存在する (POST/PATCH) 場合のみ body を設定
+            body: apiBody ? JSON.stringify(apiBody) : undefined
+        };
+
+        const apiResponse = await fetch(targetUrl, fetchOptions);
 
         // 外部APIからの応答をクライアントに返す
-        res.status(apiRes.status).send(apiRes.data);
+        let apiData = {};
+        if (apiResponse.status !== 204) {
+            apiData = await apiResponse.json();
+        }
+
+        res.status(apiResponse.status).json(apiData);
 
     } catch (error) {
-        // エラーが発生した場合も必ず応答を返す（ハングアップ回避）
-        const status = error.response ? error.response.status : 500;
-        const data = error.response ? error.response.data : { message: 'Proxy internal error' };
-        
-        console.error('API call failed:', error.message);
-        
-        res.status(status).json(data);
+        // 内部エラーが発生した場合も必ず応答を返す（ハングアップ回避）
+        console.error('Proxy internal error during API call:', error.message);
+        res.status(500).json({ message: `Proxy internal error: ${error.message}` });
     }
 };
